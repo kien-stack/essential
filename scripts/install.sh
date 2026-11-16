@@ -29,7 +29,8 @@ if ! command -v yq >/dev/null; then
   fi
 fi
 kubectl version --request-timeout=10s >/dev/null 2>&1 || die "no reachable cluster in the current kubectl context.
-  No Kubernetes? k3s in one minute: curl -sfL https://get.k3s.io | INSTALL_K3S_EXEC=\"--disable traefik\" sh -"
+  No Kubernetes? k3s in one minute (kien/stack brings its own Traefik, metrics-server and storage):
+  curl -sfL https://get.k3s.io | INSTALL_K3S_EXEC=\"--disable traefik --disable metrics-server --disable local-storage\" sh -"
 
 if [ "${1:-}" = uninstall ]; then
   # Order matters: ArgoCD manages itself, so stop the self-management first or it deletes its own
@@ -44,7 +45,7 @@ if [ "${1:-}" = uninstall ]; then
     for a in $(kubectl -n argocd get applications -o name 2>/dev/null); do unfin "${a#*/}"; done; }
   kubectl -n argocd delete appprojects platform apps --ignore-not-found >/dev/null 2>&1 || true
   helm uninstall argocd -n argocd --wait 2>/dev/null || true
-  log "done (namespaces, CRDs and PVCs are kept; delete them with kubectl if you want)"; exit 0
+  log "done (namespaces, CRDs, databases and volumes are kept; delete them with kubectl if you want)"; exit 0
 fi
 
 log "context: $(kubectl config current-context). A few questions (Enter = default):"
@@ -94,6 +95,10 @@ else
   # k3s & co already run a metrics-server: do not deploy ours
   if [ -n "$(kubectl -n kube-system get deploy metrics-server -o jsonpath='{.spec.selector.matchLabels.k8s-app}' 2>/dev/null)" ]; then
     yq -i 'del(.spec.generators[0].list.elements[] | select(.app == "metrics-server"))' argocd/applications/platform/appset.yaml
+  fi
+  # No default StorageClass (k3s --disable local-storage, bare kubeadm): OpenEBS hostpath becomes the default
+  if ! kubectl get storageclass -o jsonpath='{range .items[*]}{.metadata.annotations.storageclass\.kubernetes\.io/is-default-class}{"\n"}{end}' 2>/dev/null | grep -qx true; then
+    yq -i '.openebs.localpv-provisioner.hostpathClass.isDefaultClass = true' cluster.yaml
   fi
   [ "$tls" = selfsigned ] || log "Let's Encrypt HTTP-01: *.$dom must point to $KSTACK_IP, port 80 open from the Internet"
 

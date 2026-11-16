@@ -1,0 +1,19 @@
+# Databases (global.cnpg.storageClass in cluster.yaml): same hostpath volumes as openebs-hostpath,
+# but reclaimPolicy Retain. A deleted PVC, Cluster or namespace leaves the PV (Released) and its files
+# on disk under the base path, so the data can be recovered; delete the PV yourself when you are sure.
+{{- $lp := index .Values.openebs "localpv-provisioner" }}
+{{- $basePath := $lp.hostpathClass.basePath | default "/var/openebs/local" }}
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: openebs-hostpath-retain
+  annotations:
+    openebs.io/cas-type: local
+    cas.openebs.io/config: |
+      - name: StorageType
+        value: "hostpath"
+      - name: BasePath
+        value: {{ $basePath | quote }}
+provisioner: openebs.io/local
+volumeBindingMode: WaitForFirstConsumer
+reclaimPolicy: Retain

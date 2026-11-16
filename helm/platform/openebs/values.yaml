@@ -21,3 +21,5 @@ openebs:
     hostpathClass:
       basePath: /var/openebs/local
       isDefaultClass: false
+# Also created by this brick: StorageClass openebs-hostpath-retain (templates/storageclass-retain.yaml),
+# same base path, reclaimPolicy Retain, used by every Postgres (global.cnpg.storageClass in cluster.yaml).

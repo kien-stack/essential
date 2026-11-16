@@ -1,0 +1,65 @@
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: checks
+---
+# Read: Postgres clusters and backups, certificates. Write: new base backups only
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: kien-stack-checks
+  labels:
+    app.kubernetes.io/instance: {{ .Release.Name }}
+rules:
+  - apiGroups: [postgresql.cnpg.io]
+    resources: [clusters, backups]
+    verbs: [get, list]
+  # A base backup when the last one failed or is missing (files/checks.py)
+  - apiGroups: [postgresql.cnpg.io]
+    resources: [backups]
+    verbs: [create]
+  - apiGroups: [cert-manager.io]
+    resources: [certificates]
+    verbs: [get, list]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: kien-stack-checks
+  labels:
+    app.kubernetes.io/instance: {{ .Release.Name }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: kien-stack-checks
+subjects:
+  - kind: ServiceAccount
+    name: checks
+    namespace: {{ .Release.Namespace }}
+---
+# Its own state (last alert sent), in its namespace
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: checks-state
+rules:
+  - apiGroups: [""]
+    resources: [configmaps]
+    verbs: [create]
+  - apiGroups: [""]
+    resources: [configmaps]
+    resourceNames: [checks-state]
+    verbs: [get, patch]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: checks-state
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: checks-state
+subjects:
+  - kind: ServiceAccount
+    name: checks
+    namespace: {{ .Release.Namespace }}

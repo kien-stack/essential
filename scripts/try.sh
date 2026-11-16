@@ -25,7 +25,8 @@ if ! command -v yq >/dev/null; then
   fi
 fi
 kubectl version --request-timeout=10s >/dev/null 2>&1 || die "no reachable cluster in the current kubectl context.
-  No Kubernetes? k3s in one minute: curl -sfL https://get.k3s.io | INSTALL_K3S_EXEC=\"--disable traefik\" sh -"
+  No Kubernetes? k3s in one minute (kien/stack brings its own Traefik, metrics-server and storage):
+  curl -sfL https://get.k3s.io | INSTALL_K3S_EXEC=\"--disable traefik --disable metrics-server --disable local-storage\" sh -"
 
 if [ -d "$DIR/src/.git" ]; then git -C "$DIR/src" fetch -q origin "$REF" && git -C "$DIR/src" checkout -q FETCH_HEAD
 else mkdir -p "$DIR"; git -c advice.detachedHead=false clone -q --depth 1 -b "$REF" "$REPO" "$DIR/src"; fi
@@ -54,6 +55,10 @@ if [ "${1:-}" = uninstall ]; then
   # and can clear the finalizers of their own resources; then the operators.
   ops="cert-manager cnpg-system external-secrets openebs"
   first=$(for n in $ns; do case " $ops " in *" $n "*) ;; *) echo "$n" ;; esac; done)
+  # Demo data: volumes of openebs-hostpath-retain (databases) would stay on disk; let the provisioner delete them
+  for pv in $(kubectl get pv -o jsonpath='{range .items[?(@.spec.persistentVolumeReclaimPolicy=="Retain")]}{.metadata.name}={.spec.claimRef.namespace}{"\n"}{end}' 2>/dev/null); do
+    case " $(echo $ns) " in *" ${pv#*=} "*) kubectl patch pv "${pv%%=*}" -p '{"spec":{"persistentVolumeReclaimPolicy":"Delete"}}' >/dev/null 2>&1 || true ;; esac
+  done
   log "deleting namespaces: $(echo $first)"
   kubectl delete ns $first --ignore-not-found --wait=true --timeout=90s 2>/dev/null || true
   log "deleting operators: $ops"

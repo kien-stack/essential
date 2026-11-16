@@ -1,0 +1,5 @@
+apiVersion: v2
+name: checks
+description: kien/stack checks (one CronJob, every 15 min - backups, WAL archiving, disk, certificates; heartbeat + webhook)
+type: application
+version: 0.1.0

@@ -1,0 +1,93 @@
+{{- $c := .Values.checks }}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: checks-script
+data:
+  checks.py: |
+    {{- .Files.Get "files/checks.py" | nindent 4 }}
+---
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: checks
+spec:
+  schedule: {{ $c.schedule | quote }}
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 1
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      backoffLimit: 0
+      activeDeadlineSeconds: 300
+      ttlSecondsAfterFinished: 86400
+      template:
+        metadata:
+          annotations:
+            # new script = new pods (the CronJob template changes)
+            checksum/script: {{ .Files.Get "files/checks.py" | sha256sum | trunc 16 }}
+        spec:
+          serviceAccountName: checks
+          restartPolicy: Never
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 65534
+            runAsGroup: 65534
+            seccompProfile:
+              type: RuntimeDefault
+          containers:
+            - name: checks
+              image: "{{ $c.image.repository }}:{{ $c.image.tag }}"
+              command: ["python3", "-I", "/scripts/checks.py"]
+              env:
+                - name: CLUSTER_NAME
+                  value: {{ .Values.global.domain | default "kien/stack" | quote }}
+                - name: BACKUP_ENABLED
+                  value: {{ ne (dig "backup" "s3" "destinationPath" "" (.Values.global | default dict)) "" | quote }}
+                - name: BACKUP_MAX_AGE_HOURS
+                  value: {{ $c.backupMaxAgeHours | quote }}
+                - name: BACKUP_RETRY_MINUTES
+                  value: {{ $c.backupRetryMinutes | quote }}
+                - name: DISK_PATH
+                  value: /host/volumes
+                - name: DISK_MIN_FREE_PERCENT
+                  value: {{ $c.diskMinFreePercent | quote }}
+                - name: CERT_MIN_DAYS
+                  value: {{ $c.certMinDays | quote }}
+                - name: REPEAT_HOURS
+                  value: {{ $c.repeatHours | quote }}
+                - name: WEBHOOK_URL
+                  valueFrom:
+                    secretKeyRef:
+                      name: {{ $c.notifySecret }}
+                      key: WEBHOOK_URL
+                      optional: true
+                - name: HEARTBEAT_URL
+                  valueFrom:
+                    secretKeyRef:
+                      name: {{ $c.notifySecret }}
+                      key: HEARTBEAT_URL
+                      optional: true
+              resources:
+                {{- toYaml $c.resources | nindent 16 }}
+              securityContext:
+                allowPrivilegeEscalation: false
+                readOnlyRootFilesystem: true
+                capabilities:
+                  drop: [ALL]
+              volumeMounts:
+                - name: script
+                  mountPath: /scripts
+                  readOnly: true
+                - name: volumes
+                  mountPath: /host/volumes
+                  readOnly: true
+          volumes:
+            - name: script
+              configMap:
+                name: checks-script
+            # Only to measure free space (statvfs): read-only, nothing is read inside
+            - name: volumes
+              hostPath:
+                path: {{ $c.diskHostPath }}
+                type: DirectoryOrCreate

@@ -30,8 +30,43 @@ global:
       projectSlug: my-project
       environmentSlug: prod
       credentialsSecret: infisical-universal-auth
+  # Every Postgres: the bricks' and your apps' (cnpg-cluster chart in helm/*/<app>/Chart.yaml)
+  cnpg:
+    # One node: 1 (a second instance on the same disk is not high availability). 3+ nodes: 2 or 3.
+    instances: 1
+    # reclaimPolicy Retain: a deleted Cluster, PVC or namespace leaves the data on disk (helm/platform/openebs).
+    # Cloud cluster without OpenEBS: your provider's StorageClass, ideally one with reclaimPolicy Retain.
+    storageClass: openebs-hostpath-retain
+  # Off-cluster backups of every Postgres: WAL archived continuously + a base backup every night, so you can
+  # restore to any point of the last 30 days (docs/BACKUP.md). OFF while destinationPath is empty
+  # (./install.sh doctor says "BACKUPS OFF"). Use a bucket OUTSIDE this cluster: AWS S3, Scaleway, OVH,
+  # Cloudflare R2, Backblaze B2, a MinIO on another machine...
+  # Keys: BACKUP_S3_ACCESS_KEY_ID / BACKUP_S3_SECRET_ACCESS_KEY for install.sh (Secret external-secrets/backup-s3),
+  # never in Git. Then ./install.sh recovery-kit: the keys you need to restore, to keep outside the cluster.
+  backup:
+    s3:
+      # s3://<bucket>/<this cluster>, e.g. s3://acme-backups/prod
+      destinationPath: ""
+      # Empty = AWS S3. Otherwise e.g. https://s3.fr-par.scw.cloud, https://<account>.r2.cloudflarestorage.com
+      endpointURL: ""
+      # e.g. eu-west-3, fr-par (empty = the provider's default)
+      region: ""
+      # Where each Postgres gets the keys (external-secrets brick): do not change
+      clusterSecretStore: backup-s3
+      remoteKey: backup-s3
+    retentionPolicy: 30d
+    # Disaster recovery on a NEW cluster: the destinationPath of the lost one (docs/BACKUP.md).
+    # destinationPath above must then be a new path.
+    # restore:
+    #   from: s3://acme-backups/prod
 
 # Per-brick settings (key = upstream chart name, same as in helm/platform/<brick>/values.yaml).
+
+# Health checks every 15 min (helm/platform/checks): Postgres, WAL archiving, backup age, free disk,
+# certificates. Alerts: CHECKS_WEBHOOK_URL (Slack, Discord...) and CHECKS_HEARTBEAT_URL (healthchecks.io,
+# Uptime Kuma...: alerts you when the pings stop) for install.sh (Secret checks/checks-notify), never in Git.
+# checks:
+#   diskMinFreePercent: 15
 traefik:
   service:
     spec:

@@ -2,16 +2,20 @@
 # kien/stack Essential bootstrap (free, Apache-2.0). Run it once, from YOUR fork, after editing it:
 #   ./install.sh doctor      check the cluster and the repo
 #   ./install.sh install     install ArgoCD + apply argocd/app-of-apps.yaml (default)
+#   ./install.sh recovery-kit [file]   save the keys needed to restore this cluster (keep it OUTSIDE the cluster)
 # Everything it uses is in Git, nothing is generated:
 #   cluster.yaml             your settings (domain, TLS...), passed to every chart
 #   argocd/app-of-apps.yaml  the repo/branch ArgoCD follows (same URL in argocd/applications/*/appset.yaml)
-#   argocd/applications/platform/appset.yaml   bricks + namespace: comment out an entry to disable it
+#   argocd/applications/platform/appset.yaml   bricks + namespace (to remove one: comment it out, push,
+#                                              kubectl -n argocd delete application <brick>; data is kept)
 # After that, ArgoCD applies whatever you push. https://raw.githubusercontent.com/kien-stack/essential/main/scripts/install.sh does the edits for you.
 # Optional environment variables (secrets, never stored in Git):
 #   GIT_USERNAME / GIT_TOKEN          private GitOps repo (HTTPS)
 #   INFISICAL_CLIENT_ID / INFISICAL_CLIENT_SECRET   if global.secrets.provider=infisical
 #   DNS01_API_TOKEN                   if global.tls.issuer=letsencrypt-dns01
 #   EXTERNAL_DNS_API_TOKEN            if the external-dns brick is enabled
+#   BACKUP_S3_ACCESS_KEY_ID / BACKUP_S3_SECRET_ACCESS_KEY   if global.backup.s3 is set (off-cluster backups)
+#   CHECKS_WEBHOOK_URL / CHECKS_HEARTBEAT_URL               alerts of the checks brick (optional)
 set -euo pipefail
 
 ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
@@ -21,6 +25,8 @@ APPSET="$ROOT/argocd/applications/platform/appset.yaml"
 PACK=essential
 CMD=install
 ARGOCD_TIMEOUT=${ARGOCD_TIMEOUT:-0}   # seconds to wait for the apps, 0 = until ready
+KIT=""                                # recovery-kit output file
+KIT_EXTRA=""                          # recovery kit: this pack's other keys that encrypt data (<ns>/<secret>)
 
 log()  { printf '\033[1;34m[kien/stack]\033[0m %s\n' "$*"; }
 ok()   { printf '  \033[32mOK\033[0m   %s\n' "$*"; }
@@ -28,11 +34,12 @@ warn() { printf '  \033[33mWARN\033[0m %s\n' "$*"; }
 ko()   { printf '  \033[31mKO\033[0m   %s\n' "$*"; }
 die()  { printf '\033[31m[kien/stack] ERROR:\033[0m %s\n' "$*" >&2; exit 1; }
 
-usage() { sed -n '2,14p' "$0" | sed 's/^# \{0,1\}//'; }
+usage() { sed -n '2,18p' "$0" | sed 's/^# \{0,1\}//'; }
 
 while [ $# -gt 0 ]; do
   case "$1" in
     doctor|install) CMD=$1 ;;
+    recovery-kit) CMD=$1; KIT=${2:-}; [ -z "$KIT" ] || shift ;;
     --pack) [ "${2:-}" = "$PACK" ] || die "this repo installs the $PACK pack"; shift ;;
     -h|--help) usage; exit 0 ;;
     *) usage; die "unknown argument: $1" ;;
@@ -100,6 +107,8 @@ doctor() {
     fi
   fi
 
+  [ "$fail" -eq 0 ] && data_safety "$comps"
+
   local r; r=$(repo)
   [ -n "${KSTACK_DEMO:-}" ] || case "$r" in *kien-stack/essential*|*dedsxc/kien-stack-essential*) warn "argocd/app-of-apps.yaml still points to our public repo: put your fork's URL there (and in argocd/applications/*/appset.yaml)" ;; esac
   if grep -rq "repoURL: $r" "$ROOT"/argocd/applications/*/appset.yaml && [ "$(grep -rh 'repoURL:' "$ROOT"/argocd/applications/*/appset.yaml | sort -u | wc -l)" -eq 1 ]; then
@@ -146,6 +155,90 @@ doctor() {
   return "$fail"
 }
 
+# Storage, backups, alerts: never blocks the install on a fresh cluster, says what is off.
+data_safety() {
+  local comps=$1 n sc
+  has() { grep -qx "$1" <<<"$comps"; }
+  log "Data safety"
+  n=$(kubectl get storageclass -o jsonpath='{range .items[*]}{.metadata.annotations.storageclass\.kubernetes\.io/is-default-class}{"\n"}{end}' 2>/dev/null | grep -cx true || true)
+  if [ "$n" -gt 1 ]; then
+    warn "$n default StorageClasses ($(kubectl get storageclass -o jsonpath='{range .items[?(@.metadata.annotations.storageclass\.kubernetes\.io/is-default-class=="true")]}{.metadata.name}{" "}{end}')): PVCs land on either one. k3s: install it with --disable local-storage, or unset the default on one"
+  elif [ "$n" -eq 0 ]; then
+    warn "no default StorageClass: PVCs without a storageClassName stay Pending. OpenEBS: set openebs.localpv-provisioner.hostpathClass.isDefaultClass: true in cluster.yaml"
+  else ok "one default StorageClass: $(kubectl get storageclass -o jsonpath='{range .items[?(@.metadata.annotations.storageclass\.kubernetes\.io/is-default-class=="true")]}{.metadata.name}{end}')"; fi
+  sc=$(cfg .global.cnpg.storageClass)
+  if [ -n "$sc" ] && ! has openebs && ! kubectl get storageclass "$sc" >/dev/null 2>&1; then
+    ko "global.cnpg.storageClass $sc does not exist (openebs brick off): set your StorageClass in cluster.yaml"; fail=1
+  fi
+  # Postgres volumes created before openebs-hostpath-retain existed: still deleted with their PVC
+  local pvs; pvs=$(kubectl get pvc -A -l cnpg.io/cluster -o jsonpath='{range .items[*]}{.spec.volumeName}{"\n"}{end}' 2>/dev/null | while read -r v; do
+    [ -n "$v" ] && [ "$(kubectl get pv "$v" -o jsonpath='{.spec.persistentVolumeReclaimPolicy}' 2>/dev/null)" = Delete ] && echo "$v"; done | tr '\n' ' ' || true)
+  if [ -n "${pvs// /}" ]; then
+    warn "Postgres volumes with reclaimPolicy Delete (lost if their PVC is deleted). Keep them: for pv in $pvs; do kubectl patch pv \$pv -p '{\"spec\":{\"persistentVolumeReclaimPolicy\":\"Retain\"}}'; done"
+  fi
+  # Keys that encrypt data, generated by External Secrets: installs older than this version still have
+  # an owner reference, so deleting their ExternalSecret would delete them
+  local k; for k in infisical/infisical-secrets $KIT_EXTRA; do
+    if [ -n "$(kubectl -n "${k%%/*}" get secret "${k#*/}" -o jsonpath='{.metadata.ownerReferences}' 2>/dev/null)" ]; then
+      warn "$k is deleted with its ExternalSecret. Detach it: kubectl -n ${k%%/*} patch secret ${k#*/} --type json -p '[{\"op\":\"remove\",\"path\":\"/metadata/ownerReferences\"}]'"
+    fi
+  done
+  if [ -z "$(cfg .global.backup.s3.destinationPath)" ]; then
+    warn "BACKUPS OFF: no off-cluster copy of your databases. Set global.backup.s3 in cluster.yaml + BACKUP_S3_ACCESS_KEY_ID/BACKUP_S3_SECRET_ACCESS_KEY (docs/BACKUP.md)"
+  elif [ -n "${BACKUP_S3_ACCESS_KEY_ID:-}" ] && [ -n "${BACKUP_S3_SECRET_ACCESS_KEY:-}" ] || kubectl -n external-secrets get secret backup-s3 >/dev/null 2>&1; then
+    ok "backups: $(cfg .global.backup.s3.destinationPath)"
+  else ko "global.backup.s3 is set: BACKUP_S3_ACCESS_KEY_ID and BACKUP_S3_SECRET_ACCESS_KEY are required"; fail=1; fi
+  if [ -n "$(cfg .global.backup.restore.from)" ]; then
+    warn "restore mode: new Postgres clusters start from $(cfg .global.backup.restore.from). Remove global.backup.restore once restored"
+    # The keys that decrypt the restored data are not generated in restore mode: they come from the kit
+    for k in infisical/infisical-secrets $KIT_EXTRA; do
+      has "${k%%/*}" || continue
+      kubectl -n "${k%%/*}" get secret "${k#*/}" >/dev/null 2>&1 || { ko "restore mode: $k missing. Apply your recovery kit first: kubectl apply -f <kit>.yaml"; fail=1; }
+    done
+  fi
+  if has checks; then
+    if [ -n "${CHECKS_WEBHOOK_URL:-}${CHECKS_HEARTBEAT_URL:-}" ] || kubectl -n checks get secret checks-notify >/dev/null 2>&1; then ok "alerts: checks brick notifies you"
+    else warn "ALERTS OFF: problems are only in the checks logs. Set CHECKS_WEBHOOK_URL and/or CHECKS_HEARTBEAT_URL (docs/BACKUP.md)"; fi
+  fi
+  # applicationsSync create-update: a brick removed from the list keeps running until you delete it
+  local gone a; gone=""
+  for a in $(kubectl -n argocd get applications -o jsonpath='{range .items[?(@.metadata.ownerReferences[0].name=="platform")]}{.metadata.name}{"\n"}{end}' 2>/dev/null); do
+    has "$a" || gone="$gone $a"
+  done
+  [ -z "$gone" ] || warn "not in the platform list but still running:$gone. Remove with: kubectl -n argocd delete application <name> (databases and volumes are kept)"
+  return 0
+}
+
+# ---------------------------------------------------------------- recovery kit
+# Everything a restore needs that is neither in Git nor in the backups: the backup keys, Infisical's
+# encryption key, the Git and External Secrets credentials, the DNS tokens. One YAML file of Secrets:
+# kubectl apply -f it on the new cluster BEFORE ./install.sh install (docs/BACKUP.md).
+recovery_kit() {
+  local out=${KIT:-$HOME/kien-stack-recovery-kit-$(date +%Y%m%d).yaml} ns name ns_name found=0
+  kubectl version --request-timeout=10s >/dev/null 2>&1 || die "cluster unreachable"
+  umask 077
+  {
+    echo "# kien/stack recovery kit: $(cfg .global.domain), $(date -u +%Y-%m-%dT%H:%MZ). SECRET: store it outside the cluster"
+    echo "# (password manager, offline). Restore: docs/BACKUP.md. Backups: $(cfg .global.backup.s3.destinationPath)"
+    echo "#   endpoint: $(cfg .global.backup.s3.endpointURL)  region: $(cfg .global.backup.s3.region)  GitOps repo: $(repo) ($(rev))"
+  } >"$out"
+  for ns_name in external-secrets/backup-s3 infisical/infisical-secrets argocd/gitops-repo \
+      "external-secrets/$(cfg .global.secrets.infisical.credentialsSecret)" "cert-manager/$(cfg .global.tls.dns01.secretName)" \
+      external-dns/external-dns-api-token checks/checks-notify $KIT_EXTRA; do
+    ns=${ns_name%%/*}; name=${ns_name#*/}
+    kubectl -n "$ns" get secret "$name" >/dev/null 2>&1 || continue
+    printf -- '---\napiVersion: v1\nkind: Namespace\nmetadata:\n  name: %s\n---\n' "$ns" >>"$out"
+    kubectl -n "$ns" get secret "$name" -o yaml | yq '{"apiVersion": .apiVersion, "kind": .kind, "type": .type,
+      "metadata": {"name": .metadata.name, "namespace": .metadata.namespace} + (.metadata | with_entries(select(.key == "labels")) |
+        .labels |= with_entries(select(.key | test("external-secrets") | not)) | with_entries(select(.value | length > 0))),
+      "data": .data}' >>"$out"
+    ok "$ns/$name"; found=$((found + 1))
+  done
+  [ "$found" -gt 0 ] || die "no secret found: is this the right cluster?"
+  log "recovery kit: $out ($found secrets). Store it outside this cluster, then delete it from this machine"
+  [ -n "$(cfg .global.backup.s3.destinationPath)" ] || warn "BACKUPS OFF: the kit alone restores no data (docs/BACKUP.md)"
+}
+
 # ---------------------------------------------------------------- install
 # Install helm/platform/<name> once with Helm, exactly like ArgoCD will (values.yaml + cluster.yaml);
 # same release name, so ArgoCD takes it over.
@@ -187,6 +280,13 @@ bootstrap_secrets() {
   fi
   if has external-dns && [ -n "${EXTERNAL_DNS_API_TOKEN:-}" ]; then
     ensure_secret external-dns external-dns-api-token "api-token=$EXTERNAL_DNS_API_TOKEN"
+  fi
+  # Backup keys: a plain Secret, not in Infisical (Infisical is restored from these backups)
+  if [ -n "${BACKUP_S3_ACCESS_KEY_ID:-}" ] && [ -n "${BACKUP_S3_SECRET_ACCESS_KEY:-}" ]; then
+    ensure_secret external-secrets backup-s3 "ACCESS_KEY_ID=$BACKUP_S3_ACCESS_KEY_ID" "ACCESS_SECRET_KEY=$BACKUP_S3_SECRET_ACCESS_KEY"
+  fi
+  if has checks && [ -n "${CHECKS_WEBHOOK_URL:-}${CHECKS_HEARTBEAT_URL:-}" ]; then
+    ensure_secret checks checks-notify "WEBHOOK_URL=${CHECKS_WEBHOOK_URL:-}" "HEARTBEAT_URL=${CHECKS_HEARTBEAT_URL:-}"
   fi
   if [ "$provider" = infisical ]; then
     ensure_secret external-secrets "$(cfg .global.secrets.infisical.credentialsSecret)" \
@@ -311,6 +411,9 @@ summary() {
   echo "  ArgoCD : https://argocd.$d  (admin / kubectl -n argocd get secret argocd-initial-admin-secret -o jsonpath='{.data.password}' | base64 -d)"
   grep -qx infisical <<<"$(enabled_components)" && echo "  Infisical: https://infisical.$d (create the admin account on first visit)"
   echo "  Change anything: edit cluster.yaml or helm/*/<brick>/values.yaml in $(repo), push."
+  if [ -n "$(cfg .global.backup.s3.destinationPath)" ]; then
+    echo "  Backups: $(cfg .global.backup.s3.destinationPath). Now save the keys needed to restore: ./install.sh recovery-kit"
+  else echo "  BACKUPS OFF: set global.backup.s3 in cluster.yaml before you keep real data (docs/BACKUP.md), then ./install.sh recovery-kit"; fi
   [ "$(cfg .global.tls.issuer)" = selfsigned ] && echo "  (self-signed certificates: CA in cert-manager/selfsigned-ca)"
   return 0
 }
@@ -319,4 +422,5 @@ command -v yq >/dev/null 2>&1 || die "yq (mikefarah, v4) is required"
 case "$CMD" in
   doctor) doctor ;;
   install) install ;;
+  recovery-kit) recovery_kit ;;
 esac

@@ -5,17 +5,23 @@
 1. **A Kubernetes cluster** (>= 1.29) and a kubeconfig with *cluster-admin* rights.
    k3s, kind, minikube, EKS, GKE, AKS... all work. No cluster yet? [k3s](https://docs.k3s.io/quick-start):
    ```bash
-   curl -sfL https://get.k3s.io | INSTALL_K3S_EXEC="--disable traefik" sh -
+   curl -sfL https://get.k3s.io | INSTALL_K3S_EXEC="--disable traefik --disable metrics-server --disable local-storage" sh -
    ```
+   kien/stack brings its own Traefik, metrics-server and storage (OpenEBS): with k3s's own copies you get two
+   metrics-servers and two default StorageClasses. `./install.sh doctor` warns about both.
 2. **Resources** (allocatable): 2 vCPU, 6 GB RAM (8 GB recommended), 40 GB disk.
 3. **A load balancer** for the Traefik Service: cloud LB, k3s ServiceLB, `minikube tunnel`, or Cilium L2
    (homelab, see below). Otherwise use a NodePort (`traefik.service.spec.type: NodePort` in `cluster.yaml`, see the comment there).
-4. **Storage**: OpenEBS hostpath is installed by default (local volumes on the node disk).
-   On a cloud cluster you can keep its StorageClass and exclude `helm/platform/openebs` in
-   `argocd/applications/platform/appset.yaml`.
-5. **On your machine**: `kubectl`, `helm` >= 3.14, `git` (`yq` v4 is downloaded if missing).
+4. **Storage**: OpenEBS hostpath is installed by default (local volumes on the node disk), with two
+   StorageClasses: `openebs-hostpath` and `openebs-hostpath-retain` (databases: the data stays on disk even
+   if its volume claim is deleted). On a cloud cluster you can keep its StorageClass, exclude
+   `helm/platform/openebs` in `argocd/applications/platform/appset.yaml` and set `global.cnpg.storageClass`
+   in `cluster.yaml`.
+5. **Recommended for production: an S3 bucket outside the cluster** for the database backups
+   ([BACKUP.md](BACKUP.md)). Not needed to install: `./install.sh doctor` says `BACKUPS OFF` until it is set.
+6. **On your machine**: `kubectl`, `helm` >= 3.14, `git` (`yq` v4 is downloaded if missing).
    `./install.sh doctor` checks everything.
-6. **A Git repo** reachable from the cluster: your fork of this repo. Private repo: `GIT_USERNAME` + `GIT_TOKEN`
+7. **A Git repo** reachable from the cluster: your fork of this repo. Private repo: `GIT_USERNAME` + `GIT_TOKEN`
    (read-only is enough).
 
 Not needed: Vault, Bitnami charts, GPU, inbound Internet access (except for Let's Encrypt HTTP-01).
@@ -44,7 +50,7 @@ and add an `ExternalSecret` in your app chart (`helm/apps/<app>/templates/`).
 
 ## Databases (PostgreSQL)
 
-Every app that needs Postgres gets its **own small CloudNativePG cluster** (1 instance) in its namespace,
+Every app that needs Postgres gets its **own small CloudNativePG cluster** in its namespace,
 declared with the [cnpg-cluster](https://github.com/dedsxc/labs/tree/main/helm/cnpg-cluster) chart
 (`oci://ghcr.io/dedsxc/cnpg-cluster`) as a Helm dependency of the brick, e.g. `helm/platform/infisical`:
 
@@ -52,11 +58,25 @@ declared with the [cnpg-cluster](https://github.com/dedsxc/labs/tree/main/helm/c
 - Secret `<app>-cnpg` with `username`, `password`, `DB_HOST`, `DB_DATABASE`, `DB_CONNECTION_URI`:
   the password comes from External Secrets (`ClusterGenerator` `password-cluster-generator`, in the
   `external-secrets` brick), never from Git.
-- Volumes: `openebs-hostpath` (chart default, installed by Essential). On a cloud cluster without OpenEBS
-  (cloud StorageClass), set it in each brick with a database, e.g. `helm/platform/infisical/values.yaml`:
-  `cnpg-cluster.cluster.storage.storageClass` and `cnpg-cluster.cluster.walStorage.storageClass`.
+- Instances and volumes for every Postgres in one place, `global.cnpg` in `cluster.yaml`: 1 instance (one node),
+  StorageClass `openebs-hostpath-retain`. On a cloud cluster without OpenEBS, put your StorageClass there.
+- Backups: `global.backup` in `cluster.yaml`, see [BACKUP.md](BACKUP.md).
 
-Same pattern for your own apps: add `cnpg-cluster` to `helm/apps/<app>/Chart.yaml` and read `<app>-cnpg`.
+Same pattern for your own apps: add `cnpg-cluster` (>= 5.1.0) to `helm/apps/<app>/Chart.yaml` and read `<app>-cnpg`:
+instances, StorageClass and backups come from `cluster.yaml` too.
+
+### What protects the data
+
+- **Turning a brick off never deletes it.** The platform ApplicationSet only creates and updates Applications
+  (`applicationsSync: create-update`, `preserveResourcesOnDeletion: true`): commenting an entry out leaves the
+  brick running. To remove it, `kubectl -n argocd delete application <brick>`.
+- **ArgoCD never deletes a database.** The cnpg-cluster chart marks the `Cluster` (and what keeps it backed
+  up) `Prune=false,Delete=false`: deleting an app folder in `helm/apps/` or a brick's Application removes the
+  app but keeps its Postgres running, with its volumes. Delete one on purpose: `kubectl -n <ns> delete cluster <name>`.
+- **A deleted volume claim keeps its data.** `openebs-hostpath-retain` leaves the volume `Released`, with its
+  files under `/var/openebs/local/pvc-*`, until you delete the PersistentVolume.
+- **Infisical's encryption key is never regenerated** (`infisical-secrets`, created once), and
+  `./install.sh recovery-kit` saves it with the other keys a restore needs.
 
 ## Upgrading from v0.2.x: Postgres moved to the cnpg-cluster chart
 
@@ -100,8 +120,17 @@ Only for a cluster created **without** a CNI nor kube-proxy, e.g. k3s:
 
 ## How do I remove everything?
 
+The demo (`try.sh`) removes itself completely, namespaces and volumes included:
+
 ```bash
 curl -fsSL https://raw.githubusercontent.com/kien-stack/essential/main/scripts/try.sh | bash -s uninstall
 ```
 
-Namespaces and volumes are kept; delete them with `kubectl delete ns ...` if you want.
+A real install (`scripts/install.sh`) removes ArgoCD and the platform but keeps namespaces, databases and volumes:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/kien-stack/essential/main/scripts/install.sh | bash -s uninstall
+```
+
+Then delete what you no longer want with `kubectl delete ns ...`. Database volumes use `openebs-hostpath-retain`:
+delete their PersistentVolumes too (`kubectl get pv`, status `Released`) to free the disk.

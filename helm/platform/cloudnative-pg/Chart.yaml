@@ -1,9 +1,14 @@
 apiVersion: v2
 name: cloudnative-pg
-description: kien/stack cloudnative-pg (wraps the upstream chart)
+description: kien/stack cloudnative-pg (wraps the upstream chart + the Barman Cloud backup plugin)
 type: application
-version: 0.1.0
+version: 0.2.0
 dependencies:
   - name: cloudnative-pg
     repository: https://cloudnative-pg.github.io/charts
     version: 0.29.1
+  # Backups to S3 (WAL archiving + base backups, point-in-time recovery). Must run in the operator's
+  # namespace; its TLS certificates come from cert-manager. Idle until a cluster uses it (global.backup).
+  - name: plugin-barman-cloud
+    repository: https://cloudnative-pg.github.io/charts
+    version: 0.9.0

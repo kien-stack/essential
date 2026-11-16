@@ -1,0 +1,28 @@
+# Health checks every 15 minutes, one short-lived pod (files/checks.py, Python standard library only).
+# Alerts: CHECKS_WEBHOOK_URL (Slack, Discord, Mattermost, Google Chat...) and, when all is OK, a ping to
+# CHECKS_HEARTBEAT_URL (healthchecks.io, Uptime Kuma push, Better Stack...): its silence means a problem,
+# or the whole node down. Both in Secret checks/checks-notify (install.sh, or kubectl), never in Git.
+# Override any key below in /cluster.yaml under checks:
+checks:
+  schedule: "*/15 * * * *"
+  # A base backup older than this is a problem (the schedule is daily)
+  backupMaxAgeHours: 26
+  # A failed, missing or too old base backup is retried, at most this often
+  backupRetryMinutes: 60
+  # Free space on the disk that holds the volumes (OpenEBS base path, mounted read-only)
+  diskMinFreePercent: 15
+  diskHostPath: /var/openebs/local
+  # TLS certificates (cert-manager) expiring in less than this
+  certMinDays: 14
+  # While a problem lasts, the webhook is called again every N hours
+  repeatHours: 6
+  notifySecret: checks-notify
+  image:
+    repository: docker.io/library/python
+    tag: 3.13.9-alpine3.22
+  resources:
+    requests:
+      cpu: 10m
+      memory: 32Mi
+    limits:
+      memory: 128Mi

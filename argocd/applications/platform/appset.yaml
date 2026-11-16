@@ -6,13 +6,22 @@ metadata:
   name: platform
   namespace: argocd
 spec:
+  # Data safety: this ApplicationSet never deletes an Application. Removing an entry below (an edit,
+  # a merge, an update that turns a brick off by default) leaves the brick running, and deleting this
+  # ApplicationSet leaves every brick and its data in place. Remove a brick on purpose:
+  #   kubectl -n argocd delete application <brick>
+  # Its databases (CloudNativePG Cluster, Prune=false,Delete=false) and volumes are kept.
+  syncPolicy:
+    applicationsSync: create-update
+    preserveResourcesOnDeletion: true
   goTemplate: true
   goTemplateOptions:
     - missingkey=error
   generators:
     - list:
         # One entry = one brick (helm/platform/<app>) deployed in <namespace>.
-        # Disable a brick: comment out its entry and push (ArgoCD removes it).
+        # Disable a brick: comment out its entry, push, then kubectl -n argocd delete application <app>
+        # (data kept, see syncPolicy above). Enable one: uncomment it and push.
         elements:
           # Required: the other bricks and your apps depend on them
           - app: argocd
@@ -34,6 +43,9 @@ spec:
             namespace: reloader
           - app: metrics-server
             namespace: kube-system
+          # Health checks every 15 min: backups, WAL archiving, disk, certificates; heartbeat + webhook
+          - app: checks
+            namespace: checks
           # Off by default: uncomment to enable
           # - app: cilium
           #   namespace: kube-system
