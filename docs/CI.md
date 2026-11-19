@@ -19,6 +19,30 @@ same release or external providers) are only rendered + schema-checked. The othe
 
 Run the same checks locally: `bash hack/validate.sh` (needs `helm`, `kubectl`, `kubeconform`).
 
+## Nightly install and upgrade (`.github/workflows/nightly.yaml`)
+
+Runs every night at 02:00 UTC in `kien-stack/essential`, on demand from the Actions tab (any repo,
+including your fork), and on pull requests that change it. Each job starts a fresh single-node
+[k3s](https://docs.k3s.io/) on the runner, installed as in `docs/FAQ.md` (`--disable traefik`).
+
+| Job | What it does |
+|---|---|
+| Install | Commits the settings you would push (domain `<node-ip>.sslip.io`, self-signed certificates, ArgoCD following this repo) on a temporary branch `ci-nightly/<run>-install`, pushes it, runs `./install.sh install`, then checks that every ArgoCD Application is Synced and Healthy at that commit and still is 5 minutes later |
+| Upgrade from the previous release | Same with the previous `v*` tag and its own `install.sh` (or the `from` input), then pushes this commit with the same settings to the branch ArgoCD follows, as merging a release into your fork does, and checks again |
+
+Both jobs write the CPU and memory requests and the peak and idle usage (`kubectl top` every 15 s)
+per namespace to the job summary and to the `nightly-install` / `nightly-upgrade` artifact
+(`report.md`, `report.json`, raw samples). An application that is not healthy is listed with its
+conditions and the pods, events and logs of its namespace (summary, and `diag/` in the artifact).
+
+- The temporary branch is deleted at the end of the run. ArgoCD reads the repo with the job's own
+  token (`contents: write`, valid only while the job runs); no personal token is used.
+- Runner: `ubuntu-latest` by default. To use another one, set the repository variable
+  `NIGHTLY_RUNS_ON` (Settings > Secrets and variables > Actions > Variables) to its label in JSON:
+  `"ubuntu-latest-8-cores"` or `["self-hosted", "linux"]`. A runner smaller than `MIN_CPU` vCPU /
+  `MIN_MEM_GB` GB (workflow `env`) stops the job in its first minute.
+- Run it locally against any cluster: `.github/nightly/e2e.sh` (`wait`, `diagnose`, `report`).
+
 ## Renovate (`.github/renovate.json5`)
 
 Renovate opens PRs when a new version is available for:

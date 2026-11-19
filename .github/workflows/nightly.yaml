@@ -1,0 +1,180 @@
+---
+name: "Nightly: install and upgrade"
+
+# Installs the pack on a fresh single-node k3s, the way a customer does (docs/FAQ.md): the settings are
+# committed and pushed to the branch ArgoCD follows (a temporary ci-nightly/* branch of this repo, deleted
+# at the end), then ./install.sh install, then every ArgoCD Application must be Synced + Healthy.
+# The upgrade job installs the previous release the same way, then pushes this commit to that branch
+# (what merging a release into your fork does) and checks again. Both jobs record CPU/memory requests and
+# peak usage per namespace in the job summary and the artifact. Script: .github/nightly/e2e.sh. See docs/CI.md.
+
+on:
+  schedule:
+    - cron: "0 2 * * *" # nightly, 02:00 UTC
+  workflow_dispatch:
+    inputs:
+      from:
+        description: Release to upgrade from (empty = the tag before this commit)
+        type: string
+        default: ""
+  pull_request:
+    paths:
+      - .github/workflows/nightly.yaml
+      - .github/nightly/**
+
+concurrency:
+  group: nightly-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: write # push and delete the temporary ci-nightly/* branch that ArgoCD follows
+
+env:
+  # renovate: datasource=github-releases depName=k3s-io/k3s
+  K3S_VERSION: "v1.37.2+k3s1"
+  # renovate: datasource=github-releases depName=helm/helm
+  HELM_VERSION: "v3.19.0"
+  # renovate: datasource=github-releases depName=mikefarah/yq
+  YQ_VERSION: "v4.54.1"
+  # k3s as docs/FAQ.md installs it: its Traefik off (the pack brings one), its metrics-server kept
+  K3S_EXEC: "--disable traefik"
+  PACK: Essential
+  PROFILE: full
+  MIN_CPU: 2
+  MIN_MEM_GB: 6
+  INSTALL_MINUTES: 30
+  SETTLE_MINUTES: 5
+
+jobs:
+  install:
+    name: Install
+    # Scheduled in kien-stack only (a fork or copy runs it by hand). Pull requests from forks get a
+    # read-only token: no branch for ArgoCD to follow.
+    if: >-
+      (github.event_name != 'schedule' || github.repository_owner == 'kien-stack') &&
+      (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)
+    runs-on: ${{ fromJSON(vars.NIGHTLY_RUNS_ON || '"ubuntu-latest"') }}
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: azure/setup-helm@9bc31f4ebc9c6b171d7bfbaa5d006ae7abdb4310 # v5
+        with:
+          version: ${{ env.HELM_VERSION }}
+      - name: Runner size, k3s, usage sampler
+        id: setup
+        run: |
+          cp -r .github/nightly "$RUNNER_TEMP/nightly"
+          "$RUNNER_TEMP/nightly/e2e.sh" setup
+      - name: Commit and push the CI settings
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          "$RUNNER_TEMP/nightly/e2e.sh" configure "ci-nightly/${{ github.run_id }}-${{ github.run_attempt }}-install"
+      - name: ./install.sh install
+        run: |
+          "$RUNNER_TEMP/nightly/e2e.sh" mark install
+          ARGOCD_TIMEOUT=$((INSTALL_MINUTES * 60)) ./install.sh install
+      - name: Every Application Synced + Healthy, then idle
+        run: |
+          e2e="$RUNNER_TEMP/nightly/e2e.sh"
+          "$e2e" wait 10 "$(git rev-parse HEAD)"
+          "$e2e" mark healthy
+          sleep $((SETTLE_MINUTES * 60))
+          "$e2e" wait 5 "$(git rev-parse HEAD)"
+      - name: Diagnose
+        if: failure() && steps.setup.outcome == 'success'
+        run: |
+          "$RUNNER_TEMP/nightly/e2e.sh" diagnose
+      - name: Requests and peak usage
+        if: always() && steps.setup.outcome == 'success'
+        run: |
+          "$RUNNER_TEMP/nightly/e2e.sh" report "$PACK: install of ${GITHUB_SHA:0:7} (profile $PROFILE)"
+      - name: Delete the CI branch
+        if: always()
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          if [ -x "$RUNNER_TEMP/nightly/e2e.sh" ]; then "$RUNNER_TEMP/nightly/e2e.sh" cleanup; fi
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: always() && steps.setup.outcome == 'success'
+        with:
+          name: nightly-install
+          path: ${{ runner.temp }}/nightly-out
+          retention-days: 30
+
+  upgrade:
+    name: Upgrade from the previous release
+    if: >-
+      (github.event_name != 'schedule' || github.repository_owner == 'kien-stack') &&
+      (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)
+    runs-on: ${{ fromJSON(vars.NIGHTLY_RUNS_ON || '"ubuntu-latest"') }}
+    timeout-minutes: 75
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: azure/setup-helm@9bc31f4ebc9c6b171d7bfbaa5d006ae7abdb4310 # v5
+        with:
+          version: ${{ env.HELM_VERSION }}
+      - name: Runner size, k3s, usage sampler
+        id: setup
+        run: |
+          cp -r .github/nightly "$RUNNER_TEMP/nightly"
+          "$RUNNER_TEMP/nightly/e2e.sh" setup
+      - name: Previous release
+        id: from
+        env:
+          FROM: ${{ inputs.from }}
+        run: |
+          echo "tag=${FROM:-$("$RUNNER_TEMP/nightly/e2e.sh" previous)}" >>"$GITHUB_OUTPUT"
+      - name: Install ${{ steps.from.outputs.tag }}
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          FROM: ${{ steps.from.outputs.tag }}
+        run: |
+          e2e="$RUNNER_TEMP/nightly/e2e.sh"
+          git switch -q --detach "$FROM"
+          "$e2e" configure "ci-nightly/${{ github.run_id }}-${{ github.run_attempt }}-upgrade"
+          "$e2e" mark install
+          ARGOCD_TIMEOUT=$((INSTALL_MINUTES * 60)) ./install.sh install
+          "$e2e" wait 10 "$(git rev-parse HEAD)"
+          "$e2e" mark from-healthy
+      - name: Upgrade to ${{ github.sha }}
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          e2e="$RUNNER_TEMP/nightly/e2e.sh"
+          # Same settings on top of this commit, pushed to the branch ArgoCD follows
+          git switch -q --detach "$GITHUB_SHA"
+          "$e2e" configure "ci-nightly/${{ github.run_id }}-${{ github.run_attempt }}-upgrade"
+          "$e2e" mark upgrade
+          kubectl -n argocd annotate applications --all argocd.argoproj.io/refresh=hard --overwrite >/dev/null
+          "$e2e" wait "$INSTALL_MINUTES" "$(git rev-parse HEAD)"
+          "$e2e" mark healthy
+          sleep $((SETTLE_MINUTES * 60))
+          "$e2e" wait 5 "$(git rev-parse HEAD)"
+      - name: Diagnose
+        if: failure() && steps.setup.outcome == 'success'
+        run: |
+          "$RUNNER_TEMP/nightly/e2e.sh" diagnose
+      - name: Requests and peak usage
+        if: always() && steps.setup.outcome == 'success'
+        env:
+          FROM: ${{ steps.from.outputs.tag }}
+        run: |
+          "$RUNNER_TEMP/nightly/e2e.sh" report "$PACK: upgrade $FROM -> ${GITHUB_SHA:0:7} (profile $PROFILE)"
+      - name: Delete the CI branch
+        if: always()
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          if [ -x "$RUNNER_TEMP/nightly/e2e.sh" ]; then "$RUNNER_TEMP/nightly/e2e.sh" cleanup; fi
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: always() && steps.setup.outcome == 'success'
+        with:
+          name: nightly-upgrade
+          path: ${{ runner.temp }}/nightly-out
+          retention-days: 30
